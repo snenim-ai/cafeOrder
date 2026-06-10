@@ -689,7 +689,7 @@ export default function HomePage() {
                       ) : (
                         <button onClick={handleAddMenu} className="rounded-2xl bg-emerald-500 px-4 py-2">추가</button>
                       )}
-                      <button onClick={() => { setMenuForm({ menuName: '', price: 0, soldOutYn: false }); setEditingMenuId(null); }} className="rounded-2xl bg-slate-700 px-4 py-2">취소</button>
+                      <button onClick={() => { setMenuForm({ menuName: '', price: 0, order: managementMenus.length + 1, soldOutYn: false }); setEditingMenuId(null); }} className="rounded-2xl bg-slate-700 px-4 py-2">취소</button>
                     </div>
                   </div>
                 </div>
