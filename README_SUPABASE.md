@@ -1,46 +1,123 @@
-Supabase setup and migration guide
-=================================
+# Supabase + Vercel setup guide
 
-This project includes SQL migrations under `db/supabase_migrations`.
+This app uses Supabase as the shared database so multiple users can see the same cafe order data.
 
-Apply migrations (option A) - using Supabase CLI
+## 1. Create a Supabase project
 
-- Install the Supabase CLI: https://supabase.com/docs/guides/cli
-- Login and link to your project:
-  - `supabase login`
-  - `supabase link --project-ref <your-project-ref>`
-- Push migrations (uses `supabase` migrations format):
-  - `supabase db push`
+1. Go to Supabase and create a new project.
+2. Copy the project URL.
+   - Example: `https://xeyojidbyikqnicmojkw.supabase.co`
+3. Go to `Settings` > `API Keys`.
+4. Copy the server secret key.
+   - In the new Supabase UI this is usually under `Secret keys`.
+   - It may start with `sb_secret_...`.
+   - Do not use the publishable key for `SUPABASE_SERVICE_ROLE_KEY`.
 
-Apply migrations (option B) - using psql
+## 2. Create Supabase tables
 
-- Ensure `psql` is installed and available in PATH.
-- Set `SUPABASE_DB_URL` environment variable to your database URL (from Supabase project > Settings > Database > Connection string (URI)).
-- Run (Linux/macOS):
+Open Supabase `SQL Editor`, then run these files in order:
+
+1. `db/supabase_setup.sql`
+2. `db/supabase_seed.sql`
+
+`supabase_setup.sql` creates these tables:
+
+- `order_sheets`
+- `menus`
+- `order_items`
+
+`supabase_seed.sql` inserts the initial menu data and one optional test order sheet.
+
+The seed file is safe to run multiple times because it uses `on conflict`.
+
+## 3. Set Vercel environment variables
+
+Go to the Vercel project:
+
+`Settings` > `Environment Variables` > `Add Environment Variable`
+
+Add these variables:
+
+```text
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-supabase-secret-key
 ```
-export SUPABASE_DB_URL="postgres://user:pass@host:5432/postgres"
-./db/apply_migrations.sh
-```
-- Run (Windows PowerShell):
-```
-$env:SUPABASE_DB_URL = 'postgres://user:pass@host:5432/postgres'
-.\db\apply_migrations.ps1
-```
 
-Vercel environment variables
-----------------------------
+Recommended settings:
 
-Set the following in your Vercel project (Dashboard → Settings → Environment Variables) or via the Vercel CLI:
+```text
+SUPABASE_URL
+- Sensitive: off
+- Environments: Production, Preview, Development
 
-- `SUPABASE_URL` — your Supabase project URL (e.g. `https://xyz.supabase.co`)
-- `SUPABASE_SERVICE_ROLE_KEY` — the service role key (server-only secret)
-- `NEXT_PUBLIC_USE_SUPABASE` — set to `1` to enable Supabase mode in frontend
-
-Vercel CLI example (requires `VERCEL_TOKEN` or logged-in session):
-```
-vercel env add SUPABASE_URL production
-vercel env add SUPABASE_SERVICE_ROLE_KEY production
-vercel env add NEXT_PUBLIC_USE_SUPABASE production
+SUPABASE_SERVICE_ROLE_KEY
+- Sensitive: on
+- Environments: Production, Preview, Development
 ```
 
-Security note: only add `SUPABASE_SERVICE_ROLE_KEY` to Vercel's server environment (do NOT expose it to the browser). `NEXT_PUBLIC_*` variables are exposed to client.
+Important: put values in the `Value` field, not the `Note` field.
+
+## 4. Redeploy Vercel
+
+After adding or changing environment variables, redeploy the app:
+
+`Deployments` > latest deployment `...` > `Redeploy`
+
+Environment variable changes do not affect old deployments until redeploy.
+
+## 5. Verify the connection
+
+Open:
+
+```text
+https://your-vercel-domain.vercel.app/api/menus
+```
+
+Success response:
+
+```json
+{
+  "success": true,
+  "menus": []
+}
+```
+
+If `menus` contains rows, Supabase is connected and the app is reading shared DB data.
+
+## Troubleshooting
+
+### `Supabase environment variables not configured`
+
+Vercel does not have the required environment variables, or the app was not redeployed after adding them.
+
+Check:
+
+- `SUPABASE_URL` exists.
+- `SUPABASE_SERVICE_ROLE_KEY` exists.
+- Values are in the `Value` field.
+- The selected environment includes the deployment you are testing.
+- You redeployed after saving.
+
+### `relation "menus" does not exist`
+
+The Supabase tables were not created.
+
+Run `db/supabase_setup.sql` in Supabase SQL Editor.
+
+### Menus are empty
+
+The tables exist, but seed data was not inserted.
+
+Run `db/supabase_seed.sql` in Supabase SQL Editor.
+
+### Korean text looks broken
+
+The seed SQL may have been pasted or executed with broken encoding.
+
+Run `db/supabase_seed.sql` again from a UTF-8 editor.
+
+## Security note
+
+`SUPABASE_SERVICE_ROLE_KEY` is a powerful server-side secret. Do not commit it to GitHub and do not expose it in browser code.
+
+If the key was pasted into chat or shared accidentally, rotate it in Supabase and update the Vercel environment variable.
