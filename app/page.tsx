@@ -78,27 +78,106 @@ export default function HomePage() {
   const [menuForm, setMenuForm] = useState<{ menuName: string; price: number; order: number; soldOutYn?: boolean }>({ menuName: '', price: 0, order: 1, soldOutYn: false });
   const [editingMenuId, setEditingMenuId] = useState<string | null>(null);
   const [isMounted, setIsMounted] = useState(false);
+  const [syncError, setSyncError] = useState('');
   const hasClipboard = typeof navigator !== 'undefined' && !!navigator.clipboard;
+  const useSupabase = process.env.NEXT_PUBLIC_USE_SUPABASE !== '0';
 
   useEffect(() => {
     setIsMounted(true);
+
+    if (useSupabase) {
+      setData({ orderSheets: [], items: [], menus: [], activeOrderSheetId: null });
+      return;
+    }
 
     const stored = loadAppData();
     if (!stored.activeOrderSheetId && stored.orderSheets.length > 0) {
       stored.activeOrderSheetId = stored.orderSheets[0].id;
     }
     setData(stored);
-  }, []);
+  }, [useSupabase]);
 
   useEffect(() => {
-    if (!isMounted) return;
+    if (!isMounted || useSupabase) return;
     saveAppData(data);
-  }, [data, isMounted]);
+  }, [data, isMounted, useSupabase]);
+
+  useEffect(() => {
+    if (!isMounted || !useSupabase) return;
+    const refreshSharedData = () => {
+      fetch('/api/menus')
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.menus)) {
+            setSyncError('');
+            setData((prev) => ({ ...prev, menus: res.menus }));
+          } else {
+            setSyncError(res?.error ?? 'Supabase 메뉴 데이터를 불러오지 못했습니다.');
+          }
+        })
+        .catch((error) => setSyncError(error?.message ?? 'Supabase 메뉴 API 호출에 실패했습니다.'));
+
+      fetch('/api/order-sheets')
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.sheets)) {
+            setSyncError('');
+            setData((prev) => ({
+              ...prev,
+              orderSheets: res.sheets,
+              activeOrderSheetId:
+                prev.activeOrderSheetId && res.sheets.some((sheet: OrderSheet) => sheet.id === prev.activeOrderSheetId)
+                  ? prev.activeOrderSheetId
+                  : res.sheets.length > 0
+                    ? res.sheets[0].id
+                    : null,
+            }));
+          } else {
+            setSyncError(res?.error ?? 'Supabase 주문서 데이터를 불러오지 못했습니다.');
+          }
+        })
+        .catch((error) => setSyncError(error?.message ?? 'Supabase 주문서 API 호출에 실패했습니다.'));
+    };
+
+    refreshSharedData();
+    const intervalId = window.setInterval(refreshSharedData, 5000);
+    return () => window.clearInterval(intervalId);
+  }, [isMounted, useSupabase]);
+
+  
 
   const activeSheet = useMemo(
     () => data.orderSheets.find((sheet) => sheet.id === data.activeOrderSheetId) ?? null,
     [data.orderSheets, data.activeOrderSheetId],
   );
+
+  useEffect(() => {
+    if (!isMounted || !useSupabase) return;
+    if (!activeSheet) return;
+    const refreshActiveItems = () => {
+      fetch(`/api/orders?sheetId=${encodeURIComponent(activeSheet.id)}`)
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.items)) {
+            setSyncError('');
+            setData((prev) => ({
+              ...prev,
+              items: [
+                ...prev.items.filter((item) => item.orderSheetId !== activeSheet.id),
+                ...res.items,
+              ],
+            }));
+          } else {
+            setSyncError(res?.error ?? 'Supabase 주문 데이터를 불러오지 못했습니다.');
+          }
+        })
+        .catch((error) => setSyncError(error?.message ?? 'Supabase 주문 API 호출에 실패했습니다.'));
+    };
+
+    refreshActiveItems();
+    const intervalId = window.setInterval(refreshActiveItems, 3000);
+    return () => window.clearInterval(intervalId);
+  }, [isMounted, useSupabase, activeSheet?.id]);
 
   const activeItems = useMemo(
     () => data.items.filter((item) => item.orderSheetId === data.activeOrderSheetId),
@@ -203,12 +282,31 @@ export default function HomePage() {
       updatedAt: new Date().toISOString(),
     };
 
-    setData((prev) => {
-      const nextItems = existingItem
-        ? prev.items.map((x) => (x.id === existingItem.id ? item : x))
-        : [...prev.items, item];
-      return { ...prev, items: nextItems };
-    });
+    if (useSupabase) {
+      fetch('/api/orders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item) })
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.items)) {
+            setData((prev) => ({
+              ...prev,
+              items: [
+                ...prev.items.filter((existing) => existing.orderSheetId !== item.orderSheetId),
+                ...res.items,
+              ],
+            }));
+          } else {
+            setData((prev) => ({ ...prev, items: existingItem ? prev.items.map((x) => (x.id === existingItem.id ? item : x)) : [...prev.items, item] }));
+          }
+        })
+        .catch(() => setData((prev) => ({ ...prev, items: existingItem ? prev.items.map((x) => (x.id === existingItem.id ? item : x)) : [...prev.items, item] })));
+    } else {
+      setData((prev) => {
+        const nextItems = existingItem
+          ? prev.items.map((x) => (x.id === existingItem.id ? item : x))
+          : [...prev.items, item];
+        return { ...prev, items: nextItems };
+      });
+    }
     if (!existingItem) {
       setUserName('');
       setMenuName('');
@@ -220,7 +318,18 @@ export default function HomePage() {
   const handleNewSheet = () => {
     const cafe = CAFES[newSheetCafeId];
     const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const title = `${dateStr} ${cafe.cafeName} 메뉴취합`;
+    // Count existing sheets for same cafe and date to append a sequence number
+    const sameDateCount = data.orderSheets.filter((s) => {
+      if (!s.createdAt) return false;
+      try {
+        const sDate = s.createdAt.slice(0, 10).replace(/-/g, '');
+        return s.cafeId === cafe.cafeId && sDate === dateStr;
+      } catch {
+        return false;
+      }
+    }).length;
+    const seq = sameDateCount + 1;
+    const title = `${dateStr} ${cafe.cafeName} 메뉴취합${seq > 1 ? ' #' + seq : ''}`;
     const newSheet: OrderSheet = {
       id: makeId(),
       title,
@@ -232,25 +341,52 @@ export default function HomePage() {
       cafeFloor: cafe.cafeFloor,
       naverOrderUrl: cafe.naverOrderUrl,
     };
-    setData((prev) => ({
-      orderSheets: [newSheet, ...prev.orderSheets],
-      items: prev.items,
-      menus: prev.menus ?? [],
-      activeOrderSheetId: newSheet.id,
-    }));
+    if (useSupabase) {
+      fetch('/api/order-sheets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newSheet) })
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.sheets)) {
+            setData((prev) => ({ ...prev, orderSheets: res.sheets, activeOrderSheetId: newSheet.id }));
+          } else {
+            setData((prev) => ({ orderSheets: [newSheet, ...prev.orderSheets], items: prev.items, menus: prev.menus ?? [], activeOrderSheetId: newSheet.id }));
+          }
+        })
+        .catch(() => setData((prev) => ({ orderSheets: [newSheet, ...prev.orderSheets], items: prev.items, menus: prev.menus ?? [], activeOrderSheetId: newSheet.id })));
+    } else {
+      setData((prev) => ({
+        orderSheets: [newSheet, ...prev.orderSheets],
+        items: prev.items,
+        menus: prev.menus ?? [],
+        activeOrderSheetId: newSheet.id,
+      }));
+    }
   };
 
   const handleToggleStatus = () => {
     if (!activeSheet) return;
     const nextStatus: OrderStatus = activeSheet.status === 'OPEN' ? 'CLOSED' : 'OPEN';
-    setData((prev) => ({
-      ...prev,
-      orderSheets: prev.orderSheets.map((sheet) =>
-        sheet.id === activeSheet.id
-          ? { ...sheet, status: nextStatus, closedAt: nextStatus === 'CLOSED' ? new Date().toISOString() : null }
-          : sheet,
-      ),
-    }));
+    const updatedSheet = { ...activeSheet, status: nextStatus, closedAt: nextStatus === 'CLOSED' ? new Date().toISOString() : null };
+    if (useSupabase) {
+      fetch('/api/order-sheets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updatedSheet) })
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.sheets)) {
+            setData((prev) => ({ ...prev, orderSheets: res.sheets }));
+          } else {
+            setData((prev) => ({ ...prev, orderSheets: prev.orderSheets.map((sheet) => (sheet.id === activeSheet.id ? updatedSheet : sheet)) }));
+          }
+        })
+        .catch(() => setData((prev) => ({ ...prev, orderSheets: prev.orderSheets.map((sheet) => (sheet.id === activeSheet.id ? updatedSheet : sheet)) })));
+    } else {
+      setData((prev) => ({
+        ...prev,
+        orderSheets: prev.orderSheets.map((sheet) =>
+          sheet.id === activeSheet.id
+            ? { ...sheet, status: nextStatus, closedAt: nextStatus === 'CLOSED' ? new Date().toISOString() : null }
+            : sheet,
+        ),
+      }));
+    }
   };
 
   const handleReset = () => {
@@ -278,7 +414,20 @@ export default function HomePage() {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    setData((prev) => ({ ...prev, menus: [...(prev.menus || []), newMenu] }));
+    if (useSupabase) {
+      fetch('/api/menus', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newMenu) })
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.menus)) {
+            setData((prev) => ({ ...prev, menus: res.menus }));
+          } else {
+            setData((prev) => ({ ...prev, menus: [...(prev.menus || []), newMenu] }));
+          }
+        })
+        .catch(() => setData((prev) => ({ ...prev, menus: [...(prev.menus || []), newMenu] })));
+    } else {
+      setData((prev) => ({ ...prev, menus: [...(prev.menus || []), newMenu] }));
+    }
     setMenuForm({ menuName: '', price: 0, order: nextOrder + 1, soldOutYn: false });
     setStatusMessage('메뉴가 추가되었습니다.');
     setTimeout(() => setStatusMessage(''), 2000);
@@ -294,9 +443,8 @@ export default function HomePage() {
 
   const handleSaveMenu = () => {
     if (!editingMenuId) return;
-    setData((prev) => ({
-      ...prev,
-      menus: (prev.menus || []).map((m) =>
+    const updated = (prevMenus: any[]) =>
+      (prevMenus || []).map((m) =>
         m.id === editingMenuId
           ? {
               ...m,
@@ -307,8 +455,30 @@ export default function HomePage() {
               updatedAt: new Date().toISOString(),
             }
           : m,
-      ),
-    }));
+      );
+    if (useSupabase) {
+      const updatedMenu = {
+        id: editingMenuId,
+        cafeId: menuManagementCafeId,
+        cafeName: CAFES[menuManagementCafeId].cafeName,
+        menuName: menuForm.menuName.trim(),
+        price: menuForm.price,
+        order: menuForm.order,
+        soldOutYn: !!menuForm.soldOutYn,
+      };
+      fetch('/api/menus', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updatedMenu) })
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.menus)) {
+            setData((prev) => ({ ...prev, menus: res.menus }));
+          } else {
+            setData((prev) => ({ ...prev, menus: updated(prev.menus) }));
+          }
+        })
+        .catch(() => setData((prev) => ({ ...prev, menus: updated(prev.menus) })));
+    } else {
+      setData((prev) => ({ ...prev, menus: updated(prev.menus) }));
+    }
     setEditingMenuId(null);
     setMenuForm({ menuName: '', price: 0, order: managementMenus.length + 1, soldOutYn: false });
     setStatusMessage('메뉴가 저장되었습니다.');
@@ -317,36 +487,72 @@ export default function HomePage() {
 
   const handleDeleteMenu = (menuId: string) => {
     if (!confirm('해당 메뉴를 삭제하시겠습니까?')) return;
-    setData((prev) => ({ ...prev, menus: (prev.menus || []).filter((m) => m.id !== menuId) }));
+    if (useSupabase) {
+      fetch('/api/menus', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: menuId }) })
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.menus)) {
+            setData((prev) => ({ ...prev, menus: res.menus }));
+          } else if (res?.success) {
+            setData((prev) => ({ ...prev, menus: (prev.menus || []).filter((m) => m.id !== menuId) }));
+          }
+        })
+        .catch(() => setData((prev) => ({ ...prev, menus: (prev.menus || []).filter((m) => m.id !== menuId) })));
+    } else {
+      setData((prev) => ({ ...prev, menus: (prev.menus || []).filter((m) => m.id !== menuId) }));
+    }
   };
 
   const moveMenu = (menuId: string, direction: 'UP' | 'DOWN') => {
-    setData((prev) => {
-      const menus = prev.menus || [];
-      const cafeMenus = menus
-        .filter((menu) => menu.cafeId === menuManagementCafeId)
-        .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
-      const currentIndex = cafeMenus.findIndex((menu) => menu.id === menuId);
-      if (currentIndex === -1) return prev;
-      const targetIndex = direction === 'UP' ? currentIndex - 1 : currentIndex + 1;
-      if (targetIndex < 0 || targetIndex >= cafeMenus.length) return prev;
-      const sourceOrder = cafeMenus[currentIndex].order;
-      const targetOrder = cafeMenus[targetIndex].order;
-      const nextMenus = menus.map((menu) => {
-        if (menu.id === menuId) {
-          return { ...menu, order: targetOrder, updatedAt: new Date().toISOString() };
-        }
-        if (menu.id === cafeMenus[targetIndex].id) {
-          return { ...menu, order: sourceOrder, updatedAt: new Date().toISOString() };
-        }
-        return menu;
-      });
-      return { ...prev, menus: nextMenus };
+    const menus = data.menus || [];
+    const cafeMenus = menus
+      .filter((menu) => menu.cafeId === menuManagementCafeId)
+      .sort((a, b) => a.order - b.order || a.createdAt.localeCompare(b.createdAt));
+    const currentIndex = cafeMenus.findIndex((menu) => menu.id === menuId);
+    if (currentIndex === -1) return;
+    const targetIndex = direction === 'UP' ? currentIndex - 1 : currentIndex + 1;
+    if (targetIndex < 0 || targetIndex >= cafeMenus.length) return;
+    const now = new Date().toISOString();
+    const sourceMenu = { ...cafeMenus[currentIndex], order: cafeMenus[targetIndex].order, updatedAt: now };
+    const targetMenu = { ...cafeMenus[targetIndex], order: cafeMenus[currentIndex].order, updatedAt: now };
+    const nextMenus = menus.map((menu) => {
+      if (menu.id === sourceMenu.id) return sourceMenu;
+      if (menu.id === targetMenu.id) return targetMenu;
+      return menu;
     });
+    setData((prev) => ({ ...prev, menus: nextMenus }));
+
+    if (useSupabase) {
+      Promise.all(
+        [sourceMenu, targetMenu].map((menu) =>
+          fetch('/api/menus', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(menu) })
+            .then((r) => r.json()),
+        ),
+      )
+        .then((results) => {
+          const latest = results.find((res) => res?.success && Array.isArray(res.menus));
+          if (latest) setData((prev) => ({ ...prev, menus: latest.menus }));
+        })
+        .catch(() => {});
+    }
   };
 
   const toggleSoldOut = (menuId: string) => {
-    setData((prev) => ({ ...prev, menus: (prev.menus || []).map((m) => (m.id === menuId ? { ...m, soldOutYn: !m.soldOutYn, updatedAt: new Date().toISOString() } : m)) }));
+    const menu = data.menus?.find((m) => m.id === menuId);
+    if (!menu) return;
+    const updatedMenu = { ...menu, soldOutYn: !menu.soldOutYn, updatedAt: new Date().toISOString() };
+    setData((prev) => ({ ...prev, menus: (prev.menus || []).map((m) => (m.id === menuId ? updatedMenu : m)) }));
+
+    if (useSupabase) {
+      fetch('/api/menus', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updatedMenu) })
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.menus)) {
+            setData((prev) => ({ ...prev, menus: res.menus }));
+          }
+        })
+        .catch(() => {});
+    }
   };
 
   const handleCopyResult = async () => {
@@ -408,6 +614,12 @@ export default function HomePage() {
           </button>
         </div>
       </div>
+
+      {syncError ? (
+        <div className="mb-6 rounded-2xl border border-rose-400/40 bg-rose-950/70 px-4 py-3 text-sm text-rose-100">
+          Supabase 연결 오류: {syncError}
+        </div>
+      ) : null}
 
       <section className="grid gap-6 lg:grid-cols-[1.3fr_0.7fr]">
         <article className="space-y-5 rounded-3xl border border-white/10 bg-slate-900/80 p-6 shadow-xl shadow-black/10">
